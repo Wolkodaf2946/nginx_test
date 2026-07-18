@@ -1,0 +1,20 @@
+services:
+  backend:
+    build: ./backend
+    container_name: todo_backend
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        # Браузер обращается к бэкенду напрямую по опубликованному порту.
+        VITE_API_URL: http://localhost:8080/api
+    container_name: todo_frontend
+    ports:
+      - "4173:4173"
+    depends_on:
+      - backend
+    restart: unless-stopped
