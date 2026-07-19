@@ -22,6 +22,7 @@
 - [Часть 7. upstream и балансировка нагрузки](#часть-7-upstream-и-балансировка)
 - [Часть 8. Production-настройки: логи, gzip, кэш, лимиты](#часть-8-production-настройки)
 - [Часть 9. HTTPS и TLS](#часть-9-https-и-tls)
+- [Часть 9.5. Боевой HTTPS на своём домене через certbot](#часть-95-боевой-https-на-своём-домене-через-certbot)
 - [Часть 10. Внутренности и подготовка к собеседованию](#часть-10-внутренности-и-собеседование)
 
 ---
@@ -1276,6 +1277,9 @@ server {
 > или через связку с `acme.sh`. Certbot сам получает и **автоматически продлевает**
 > сертификат (он живёт 90 дней). Принцип конфига тот же — меняются только пути
 > к сертификату.
+>
+> 👉 Полный практический разбор для реального домена в Docker (certbot, webroot,
+> автопродление, правильное проксирование с TLS-терминацией) — в **Части 9.5**.
 
 ### Домашнее задание
 
@@ -1300,6 +1304,335 @@ server {
 
 5. **Ответь:** что такое TLS-терминация и почему бэкенду не обязательно самому
    заниматься HTTPS? Зачем при этом всё равно пробрасывают `X-Forwarded-Proto`?
+
+---
+
+## Часть 9.5. Боевой HTTPS на своём домене через certbot
+
+Часть 9 дала self-signed сертификат для локалки (браузер ему не доверяет). Теперь —
+**настоящий** сертификат от **Let's Encrypt**, которому доверяют все браузеры,
+бесплатно и с автопродлением. Это то, что реально стоит в проде. Делаем для сетапа
+в Docker Compose (nginx в контейнере) — именно так, как у тебя.
+
+### Что понадобится (предусловия)
+
+1. **Домен**, указывающий на IP твоего сервера. В DNS-настройках домена должна быть
+   **A-запись** (для IPv4) — например `example.com → 203.0.113.10`. Если нужен и
+   `www` — добавь вторую A-запись `www.example.com → тот же IP`. Проверь, что
+   применилось:
+   ```bash
+   dig +short example.com        # должен вернуть IP твоего сервера
+   ```
+   DNS обновляется не мгновенно (до нескольких часов) — дождись, иначе выпуск упадёт.
+
+2. **Открытые порты 80 и 443** на сервере (firewall / security group облака).
+   Порт 80 нужен обязательно, даже если сайт только по HTTPS — через него идёт
+   проверка владения доменом (см. ниже).
+
+3. **Проект уже поднимается** через docker-compose на этом сервере.
+
+### Как Let's Encrypt проверяет, что домен твой (ACME http-01)
+
+Центр сертификации не выдаёт сертификат кому попало — он должен убедиться, что ты
+**контролируешь домен**. Механизм называется **ACME challenge**, самый частый вариант —
+**http-01**:
+
+```
+1. certbot говорит Let's Encrypt: "хочу сертификат на example.com"
+2. Let's Encrypt: "докажи. Положи файл с таким-то токеном по адресу
+   http://example.com/.well-known/acme-challenge/<токен>"
+3. certbot кладёт этот файл в webroot-папку, которую отдаёт nginx
+4. Let's Encrypt заходит по http://example.com/.well-known/... и читает токен
+5. Совпало → домен твой → выдаётся сертификат (в /etc/letsencrypt/live/example.com/)
+```
+
+Вот почему **порт 80 должен быть открыт и отдавать `/.well-known/acme-challenge/`
+по обычному HTTP без редиректа** — это канал проверки. Запомни это, к нему вернёмся
+в подводных камнях.
+
+### Проблема «курицы и яйца» в Docker
+
+Тонкий момент, о который все спотыкаются: чтобы nginx запустился с `listen 443 ssl`,
+ему нужны **файлы сертификата**. Но чтобы **получить** сертификат, нужен запущенный
+nginx, отдающий ACME-challenge на порту 80. Замкнутый круг.
+
+Решаем в два шага: **сначала поднимаем nginx только по HTTP** (он умеет отдавать
+challenge и без сертификата), **получаем сертификат**, и **только потом** добавляем
+HTTPS-блок.
+
+### Шаг 1. Volumes и сервис certbot в docker-compose
+
+Добавь в `docker-compose.yaml` две общие папки (webroot для challenge и хранилище
+сертификатов) и сервис `certbot`:
+
+```yaml
+services:
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: todo_nginx
+    ports:
+      - "80:80"
+      - "443:443"                                   # добавили HTTPS-порт
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./certbot/www:/var/www/certbot:ro           # сюда certbot кладёт challenge
+      - ./certbot/conf:/etc/letsencrypt:ro          # сюда — сами сертификаты
+    depends_on:
+      - backend
+      - frontend
+    restart: unless-stopped
+
+  certbot:
+    image: certbot/certbot
+    container_name: todo_certbot
+    volumes:
+      - ./certbot/www:/var/www/certbot:rw           # те же папки, но на запись
+      - ./certbot/conf:/etc/letsencrypt:rw
+    # по умолчанию простаивает; запускаем вручную командой ниже
+    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do sleep 6h & wait $${!}; certbot renew; done'"
+```
+
+Обрати внимание: nginx монтирует те же папки **на чтение** (`:ro`), а certbot —
+**на запись** (`:rw`). Так они обмениваются файлами: certbot пишет — nginx читает.
+
+### Шаг 2. Bootstrap-конфиг (только HTTP, для получения сертификата)
+
+Временно замени `nginx/conf.d/default.conf` на HTTP-only вариант — он умеет отдавать
+challenge и пока проксирует сайт по обычному HTTP (замени `example.com` на свой домен):
+
+```nginx
+server {
+    listen 80;
+    server_name example.com www.example.com;    # ТВОЙ реальный домен, не localhost!
+
+    # ACME-challenge: отдаём файлы, которые кладёт certbot. БЕЗ редиректа!
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    # пока сертификата нет — просто проксируем сайт по HTTP
+    location /api/ {
+        proxy_pass http://backend:8080;
+    }
+    location / {
+        proxy_pass http://frontend:4173;
+    }
+}
+```
+
+Подними стек и проверь, что домен открывается по HTTP:
+```bash
+docker compose up -d
+curl -I http://example.com          # ожидаешь ответ от твоего сайта
+```
+
+### Шаг 3. Получаем сертификат
+
+**Сначала — в тестовом режиме `--staging`** (у Let's Encrypt строгий лимит: ~5 боевых
+сертификатов на домен в неделю; на этапе отладки легко его выжечь, а staging — без
+лимитов, но сертификат «ненастоящий»):
+
+```bash
+docker compose run --rm certbot certonly \
+  --webroot -w /var/www/certbot \
+  -d example.com -d www.example.com \
+  --email you@example.com --agree-tos --no-eff-email \
+  --staging
+```
+
+Разбор флагов:
+- `certonly` — только получить сертификат, ничего не настраивать (конфиг мы пишем сами).
+- `--webroot -w /var/www/certbot` — метод webroot: класть challenge в эту папку
+  (её отдаёт nginx из Шага 2).
+- `-d ...` — домены (можно несколько; первый станет именем папки в `live/`).
+- `--staging` — тестовый CA.
+
+Если увидел `The dry run was successful` / успешный выпуск staging — значит цепочка
+работает. Теперь получаем **боевой** сертификат (убираем `--staging`, добавляем
+`--force-renewal`, чтобы перезаписать staging-версию):
+
+```bash
+docker compose run --rm certbot certonly \
+  --webroot -w /var/www/certbot \
+  -d example.com -d www.example.com \
+  --email you@example.com --agree-tos --no-eff-email \
+  --force-renewal
+```
+
+Сертификат появится в `./certbot/conf/live/example.com/`:
+- `fullchain.pem` — сертификат + промежуточные (его указываем в `ssl_certificate`),
+- `privkey.pem` — приватный ключ (`ssl_certificate_key`).
+
+### Шаг 4. Финальный конфиг: редирект + HTTPS + проксирование
+
+Теперь, когда сертификат есть, переписываем `nginx/conf.d/default.conf` в боевой вид —
+**два server-блока**: HTTP (challenge + редирект) и HTTPS (основной сайт):
+
+```nginx
+# --- HTTP :80 — только challenge и редирект на HTTPS ---
+server {
+    listen 80;
+    server_name example.com www.example.com;
+
+    # ВАЖНО: challenge оставляем на HTTP без редиректа — иначе продление сломается
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    # всё остальное — жёстко на HTTPS
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+# --- HTTPS :443 — основной сайт ---
+server {
+    listen 443 ssl;
+    http2 on;                                  # HTTP/2 поверх TLS — быстрее
+    server_name example.com www.example.com;
+
+    # Сертификаты от Let's Encrypt
+    ssl_certificate     /etc/letsencrypt/live/example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/example.com/privkey.pem;
+
+    # Современные настройки TLS
+    ssl_protocols       TLSv1.2 TLSv1.3;       # старьё (1.0/1.1) выключено
+    ssl_prefer_server_ciphers off;             # для TLS1.3 выбор шифра за клиентом
+    ssl_session_cache   shared:SSL:10m;        # кэш сессий → меньше рукопожатий
+    ssl_session_timeout 1d;
+
+    # HSTS: браузер запомнит ходить только по HTTPS (год). Включай, когда уверен,
+    # что HTTPS работает стабильно — откатить сложно (браузеры кэшируют).
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+
+    # --- API: проксируем на бэкенд ---
+    location /api/ {
+        limit_req zone=api_limit burst=20 nodelay;
+        proxy_pass http://backend:8080;
+
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;   # тут будет "https"
+    }
+
+    # --- Фронтенд ---
+    location / {
+        proxy_pass http://frontend:4173;
+
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+Применяем без даунтайма:
+```bash
+docker compose exec nginx nginx -t          # проверить синтаксис
+docker compose exec nginx nginx -s reload   # применить
+```
+
+Открой `https://example.com` — зелёный замочек, доверенный сертификат. HTTP
+автоматически редиректит на HTTPS.
+
+### Как ПРАВИЛЬНО проксировать с SSL (то, что часто спрашивают)
+
+Ключевая схема называется **TLS-терминация** и работает так:
+
+```
+браузер ──HTTPS (443, шифрованно)──► nginx ──HTTP (8080, открыто)──► backend
+         внешний, недоверенный канал         внутренняя Docker-сеть,
+         → обязателен TLS                     доверенная → TLS не нужен
+```
+
+Три правила правильного SSL-проксирования:
+
+1. **TLS расшифровывается на nginx, до бэкенда идёт обычный HTTP.** Бэкенд внутри
+   Docker-сети (`backend:8080`) не занимается сертификатами вообще — это дёшево и
+   просто. Сеть между контейнерами доверенная, шифровать её незачем.
+
+2. **Обязательно пробрасывай `X-Forwarded-Proto $scheme`.** Бэкенд получает запрос по
+   HTTP и «думает», что снаружи тоже был HTTP. Этот заголовок сообщает ему, что
+   изначально был **https**. Без него бэкенд, генерируя абсолютные ссылки или редиректы,
+   выдаст `http://...` — и получится «смешанный контент» или редирект-петля. Твой Go
+   за прокси должен доверять именно этому заголовку, а не своему соединению.
+
+3. **`Host $host`** — чтобы бэкенд видел реальный домен (`example.com`), а не
+   `backend:8080`.
+
+> **Когда шифруют и до бэкенда (end-to-end TLS)?** В моделях zero-trust или когда
+> бэкенд в другой сети/дата-центре. Тогда `proxy_pass https://backend:8443;` и бэкенд
+> тоже с сертификатом. Для одной Docker-сети это избыточно — стандарт тут TLS-терминация.
+
+> **WebSocket за HTTPS.** Если появится WebSocket (`wss://`), в его `location` добавь
+> проброс апгрейда: `proxy_set_header Upgrade $http_upgrade;` и
+> `proxy_set_header Connection "upgrade";` + `proxy_http_version 1.1;`. Для обычного
+> REST-API (как твой todo) это не нужно.
+
+### Автопродление (сертификат живёт 90 дней)
+
+Let's Encrypt выдаёт сертификаты на **90 дней** — это заставляет автоматизировать
+продление. У тебя это уже настроено сервисом `certbot` из Шага 1: его `entrypoint`
+каждые 6 часов вызывает `certbot renew`. `renew` продлевает сертификат, только если
+до истечения осталось меньше 30 дней (иначе ничего не делает) — так что дёргать часто
+безопасно.
+
+Один нюанс: после продления **nginx должен перечитать** новый сертификат. Простое
+решение — периодически перезагружать nginx. Замени его запуск на самоперезагружающийся:
+
+```yaml
+  nginx:
+    # ... остальное как выше ...
+    command: >
+      /bin/sh -c 'while :; do sleep 6h & wait $${!}; nginx -s reload; done & nginx -g "daemon off;"'
+```
+
+Проверить продление вручную (без реального выпуска):
+```bash
+docker compose run --rm certbot renew --dry-run
+```
+
+### Подводные камни (частые ошибки)
+
+- **`/.well-known/acme-challenge/` попал под редирект на HTTPS** → продление падает
+  (Let's Encrypt ходит по HTTP). В HTTP-блоке этот `location` должен стоять **выше**
+  редиректа и отдавать webroot — как в конфиге Шага 4.
+- **`server_name` = `localhost`** вместо реального домена → сертификат не выпустится.
+  Домен в `server_name` и в `-d` у certbot должны совпадать.
+- **Сжёг лимит боевых сертификатов** (5/неделю на домен), отлаживаясь без `--staging`.
+  Всегда сначала `--staging`.
+- **Порт 80/443 закрыт файрволом** → challenge не проходит или сайт недоступен.
+  Проверь `sudo ss -tlnp | grep -E ':80|:443'` и правила облака.
+- **DNS ещё не обновился** → Let's Encrypt резолвит домен в старый/чужой IP.
+  Дождись `dig +short example.com` = твой IP.
+
+### Домашнее задание
+
+1. **Настрой A-запись** домена на IP своего сервера, дождись `dig +short твой-домен`
+   = нужный IP. Открой порты 80 и 443.
+
+2. **Пройди Шаги 1–3**: подними bootstrap-конфиг (HTTP), получи сертификат сначала со
+   `--staging`, убедись, что цепочка работает, потом выпусти боевой.
+
+3. **Переключись на боевой конфиг** (Шаг 4). Проверь:
+   ```bash
+   curl -I http://твой-домен      # ожидаешь 301 → https
+   curl -I https://твой-домен     # ожидаешь 200, БЕЗ флага -k (сертификат доверенный!)
+   ```
+   Открой сайт в браузере — должен быть валидный замочек.
+
+4. **Проверь оценку SSL.** Прогони домен через `https://www.ssllabs.com/ssltest/`.
+   С конфигом выше должен получиться рейтинг **A**. Посмотри, что он оценивает
+   (протоколы, шифры, цепочку) — это отличная пища для понимания TLS.
+
+5. **Проверь автопродление** командой `docker compose run --rm certbot renew --dry-run`.
+   Должно завершиться успешно, ничего реально не продлевая.
+
+6. **Ответь:** почему `/.well-known/acme-challenge/` нельзя редиректить на HTTPS?
+   Почему бэкенду внутри Docker-сети не нужен свой TLS-сертификат?
 
 ---
 

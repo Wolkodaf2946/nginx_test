@@ -2,19 +2,36 @@ services:
   backend:
     build: ./backend
     container_name: todo_backend
-    ports:
-      - "8080:8080"
+    expose:
+      - "8080"                               # виден только внутри сети, не наружу
     restart: unless-stopped
 
   frontend:
     build:
       context: ./frontend
       args:
-        # Браузер обращается к бэкенду напрямую по опубликованному порту.
-        VITE_API_URL: http://localhost:8080/api
+        # Относительный путь: браузер шлёт на /api, а nginx проксирует на бэкенд.
+        # Тот же origin (localhost:80) → CORS не нужен.
+        # Нельзя писать http://backend:8080 — имя "backend" резолвится только
+        # ВНУТРИ Docker-сети, а этот код выполняется в браузере на хосте.
+        VITE_API_URL: /api
     container_name: todo_frontend
-    ports:
-      - "4173:4173"
+    expose:
+      - "4173"
     depends_on:
       - backend
+    restart: unless-stopped
+
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: todo_nginx
+    ports:
+      - "80:80"                              # единственный вход наружу
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+    depends_on:
+      - backend
+      - frontend
     restart: unless-stopped
