@@ -77,7 +77,8 @@
 - **Порт** — номер «двери» на машине (0–65535). На одной машине много сервисов,
   порт говорит, к какому именно ты стучишься.
   - `80` — HTTP по умолчанию, `443` — HTTPS по умолчанию.
-  - В твоём проекте бэкенд слушает `8080`, фронт (vite preview) — `4173`.
+  - В твоём проекте бэкенд слушает `8080`, а фронт в dev-режиме (`npm run dev`) — `5173`
+    (в проде статику фронта раздаёт nginx).
 - **Сокет** — конкретная пара `IP:порт`, например `127.0.0.1:8080`. Это то, что
   «слушает» сервер. Двух процессов на одном `IP:порт` быть не может — отсюда ошибка
   `address already in use`, которую ты обязательно однажды увидишь.
@@ -352,12 +353,14 @@ touch nginx/nginx.conf
 Пока пусто — наполнять будем со следующей части. Структура будет такой:
 ```
 todoList-testNGINX/
-├── nginx/
-│   ├── nginx.conf        # главный конфиг (напишем в Части 3)
+├── nginx/                    # EDGE-nginx (reverse proxy перед всем)
+│   ├── nginx.conf            # главный конфиг (Часть 3)
 │   └── conf.d/
-│       └── default.conf  # конфиг нашего сайта (Части 4–8)
-├── backend/              # Go API (:8080)
-├── frontend/             # React
+│       └── default.conf      # server-блок edge: роутинг + TLS (Части 6, 8, 9.5)
+├── backend/                  # Go API (:8080)
+├── frontend/                 # React + свой nginx (веб-сервер статики)
+│   ├── Dockerfile            # multi-stage: сборка → nginx (Часть 6)
+│   └── nginx.conf            # внутренний nginx фронта: раздача dist (Часть 6)
 └── docker-compose.yaml
 ```
 
@@ -601,6 +604,12 @@ docker run --rm -p 8081:80 \
 
 > Заметь: кнопки в приложении пока не будут работать — фронт стучится в `/api/...`,
 > а мы ещё не настроили проксирование на бэкенд. Это ровно то, что чиним в Части 6.
+>
+> И ещё: здесь мы раздаём статику «на скорую руку» смонтированной папкой — чтобы
+> освоить `root`/`try_files`. В финальной архитектуре (Часть 6) эта раздача переедет
+> **внутрь фронт-контейнера** (его собственный nginx), а на edge-nginx останется только
+> проксирование. Механика `root`/`try_files` из этой части — ровно то, что будет
+> в `frontend/nginx.conf`.
 
 ### Домашнее задание
 
@@ -718,8 +727,10 @@ server {
 
 ## Часть 6. Reverse proxy
 
-Кульминация курса: свяжем всё вместе. nginx будет **одновременно** раздавать React-статику
-и **проксировать** `/api` на Go-бэкенд. Единый вход, никакого CORS.
+Кульминация курса: свяжем всё вместе. Итоговая топология — **два nginx** за одним
+доменом: фронт-контейнер со своим nginx раздаёт статику React, а **edge-nginx** стоит
+перед всем и проксирует `/` на фронт, а `/api` — на Go-бэкенд. Единый вход, один
+origin, никакого CORS.
 
 ### proxy_pass — основа проксирования
 
@@ -782,18 +793,93 @@ location /api/ {
 `$host`, `$remote_addr`, `$scheme` — это **встроенные переменные** nginx. Их десятки;
 эти четыре — самые ходовые.
 
-### Финальный конфиг: статика + проксирование
+### Почему у фронтенда свой веб-сервер (ключевая развилка)
 
-Вот он, целевой `nginx/conf.d/default.conf` всего курса:
+Собранный React — это **просто папка файлов** (`dist/`: `index.html`, `app.js`,
+`app.css`). Файлы сами себя по сети не отдают — нужна программа-веб-сервер, которая
+слушает порт и отдаёт их браузеру.
+
+- Если бы фронт был на **Next.js/Nuxt (SSR)** — он сам себе сервер (Node-процесс),
+  отдельный раздатчик не нужен.
+- У нас **Vite + React = статика**. В dev её раздаёт `vite dev`/`vite preview`, но это
+  **dev-инструменты** (в проде не годятся; ещё и Host-проверка `allowedHosts` мешает
+  за прокси). Значит, в проде внутри фронт-контейнера должен работать нормальный
+  веб-сервер — **nginx**.
+
+Отсюда финальная топология — **два nginx** за одним доменом:
+
+```
+браузер → edge-nginx (:80/:443, reverse proxy + TLS)
+            ├─ /      → frontend:80  (nginx раздаёт статику React)
+            └─ /api/  → backend:8080 (Go)
+```
+
+У каждого своя роль: nginx фронт-контейнера **раздаёт файлы**, edge-nginx
+**терминирует TLS и роутит**. Это классический паттерн «веб-сервер приложения +
+reverse proxy перед ним».
+
+### Шаг 1. Фронт-контейнер как веб-сервер
+
+Превращаем фронт в самодостаточный образ: Node собирает статику, nginx её раздаёт.
+
+`frontend/Dockerfile` (multi-stage):
+```dockerfile
+# Стадия 1: сборка статики
+FROM node:20-alpine AS build
+WORKDIR /app
+COPY package.json package-lock.json* ./
+RUN npm ci
+COPY . .
+ARG VITE_API_URL=/api          # относительный /api вшивается в бандл
+ENV VITE_API_URL=$VITE_API_URL
+RUN npm run build
+
+# Стадия 2: nginx раздаёт dist
+FROM nginx:1.27-alpine
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+COPY --from=build /app/dist /usr/share/nginx/html
+EXPOSE 80
+```
+
+`frontend/nginx.conf` (внутренний nginx фронта — раздача статики со SPA-fallback):
+```nginx
+server {
+    listen 80;
+    server_name _;
+
+    root /usr/share/nginx/html;
+    index index.html;
+
+    location / {
+        try_files $uri $uri/ /index.html;   # SPA-fallback (Часть 4)
+    }
+
+    location /assets/ {                      # ассеты с хэшем → долгий кэш
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+    }
+}
+```
+
+Этот nginx **только раздаёт файлы**. Ни `/api`, ни TLS тут нет — это забота edge.
+`VITE_API_URL=/api` значит, что фронт шлёт запросы на **относительный** `/api` (тот же
+origin) — их поймает edge-nginx.
+
+> Для локальной разработки (`npm run dev`) статику и проксирование `/api` берёт на себя
+> сам Vite (`server.proxy` в `vite.config.js`). nginx-раздача нужна только в контейнере.
+
+### Шаг 2. Edge-nginx: reverse proxy
+
+Теперь **целевой `nginx/conf.d/default.conf`** — это edge, он стоит перед всеми:
 
 ```nginx
 server {
     listen 80;
-    server_name localhost;
+    server_name localhost;          # на проде заменим на домен (Часть 9.5)
 
-    # --- API: проксируем на Go-бэкенд ---
+    # --- API: на Go-бэкенд ---
     location /api/ {
-        proxy_pass http://backend:8080;    # "backend" — имя сервиса в compose
+        proxy_pass http://backend:8080;   # без слэша → префикс /api сохраняется
 
         proxy_set_header Host              $host;
         proxy_set_header X-Real-IP         $remote_addr;
@@ -801,92 +887,100 @@ server {
         proxy_set_header X-Forwarded-Proto $scheme;
     }
 
-    # --- Всё остальное: статика React ---
+    # --- Всё остальное: на nginx фронт-контейнера ---
     location / {
-        root /usr/share/nginx/html;
-        index index.html;
-        try_files $uri $uri/ /index.html;   # SPA-fallback (Часть 4)
+        proxy_pass http://frontend:80;    # фронт раздаёт статику сам
+
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
     }
 }
 ```
 
-Обрати внимание: имя `backend` вместо `localhost:8080`. Внутри Docker-сети
-`localhost` — это сам контейнер nginx, а не бэкенд. Резолвить имя сервиса в IP
-контейнера будет встроенный DNS Docker (см. Часть 0).
+Имена `backend` и `frontend` — это имена сервисов в compose; встроенный DNS Docker
+резолвит их в IP контейнеров (см. Часть 0). `localhost` тут писать нельзя — внутри
+контейнера nginx это он сам.
 
-### Собираем всё в docker-compose
+### Шаг 3. Собираем всё в docker-compose
 
-Теперь оформим постоянный сетап. Обнови `docker-compose.yaml` в корне проекта:
+Три сервиса: бэкенд, фронт (свой nginx) и edge-nginx перед ними.
 
 ```yaml
 services:
-  nginx:
-    image: nginx:1.27-alpine
-    container_name: todo_nginx
-    ports:
-      - "80:80"                              # единственный вход наружу
-    volumes:
-      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./nginx/conf.d:/etc/nginx/conf.d:ro
-      - ./frontend/dist:/usr/share/nginx/html:ro   # заранее собранный React
-    depends_on:
-      - backend
-    restart: unless-stopped
-
   backend:
     build: ./backend
     container_name: todo_backend
     expose:
-      - "8080"                               # виден только внутри сети, не наружу
+      - "8080"                     # виден только внутри сети
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_URL: /api          # относительный путь; edge проксирует на бэк
+    container_name: todo_frontend
+    expose:
+      - "80"                        # nginx фронта, только внутри сети
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:1.27-alpine        # edge — обычный образ, статику не хранит
+    container_name: todo_nginx
+    ports:
+      - "80:80"                     # единственный вход наружу
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+    depends_on:
+      - backend
+      - frontend
     restart: unless-stopped
 ```
 
-> Здесь фронт мы **не собираем в контейнере** — просто монтируем заранее собранную
-> `frontend/dist`. Это классический паттерн: собрать статику на CI и отдать её nginx.
-> (Как вариант — multi-stage сборка фронта в образ; сделаешь в домашке.)
+Наружу торчит **только edge-nginx** (порт 80). Бэкенд и фронт — `expose` (видны лишь
+внутри Docker-сети), снаружи к ним напрямую не подключиться.
 
 Запуск:
 ```bash
-cd frontend && npm run build && cd ..     # собрать статику
-docker compose up --build                 # поднять nginx + backend
+docker compose up -d --build      # соберёт фронт в образ и поднимет всё
 ```
 
 Открой `http://localhost` (порт 80, без номера!). Теперь:
-- React грузится с nginx (статика),
-- кнопки todo работают — запросы `/api/todos` проксируются на Go-бэкенд,
-- всё на одном origin → **CORS больше не нужен**.
+- React отдаётся edge → nginx фронта (статика),
+- кнопки todo работают — `/api/todos` идёт edge → бэкенд,
+- всё на одном origin → **CORS не нужен**.
 
-Ты только что построил ровно ту схему, что рисовал в домашке Части 1.
+Ты построил ровно ту схему, что рисовал в домашке Части 1: браузер → edge-nginx →
+(фронт-статика + Go-бэкенд).
 
 ### Домашнее задание
 
-1. **Подними полный сетап** через docker-compose. Добейся, чтобы todo-приложение
-   полностью работало через `http://localhost` (добавление, отметка, удаление).
+1. **Подними полный сетап** через `docker compose up -d --build`. Добейся, чтобы
+   todo-приложение полностью работало через `http://localhost` (добавление, отметка,
+   удаление).
 
-2. **Докажи, что проксирование живое.** Открой вкладку Network в браузере (F12),
-   поделай действия с todo. Убедись, что запросы идут на `http://localhost/api/todos`
-   (тот же origin, порт 80), а не напрямую на `:8080`.
+2. **Докажи, что проксирование живое.** Открой вкладку Network (F12), поделай действия
+   с todo. Убедись, что запросы идут на `http://localhost/api/todos` (тот же origin,
+   порт 80), а не напрямую на `:8080`.
 
 3. **Сломай слэш и почини.** Добавь завершающий `/` в `proxy_pass http://backend:8080/;`,
-   перезапусти. Приложение отвалится с ошибками (бэкенд получает `/todos` вместо
-   `/api/todos` и отвечает 404). Посмотри это в Network. Убери слэш — почини. **Теперь
-   ты никогда не забудешь про завершающий слэш.**
+   перезапусти edge (`docker compose restart nginx`). Приложение отвалится (бэкенд
+   получает `/todos` вместо `/api/todos` → 404). Посмотри в Network. Убери слэш — почини.
+   **Теперь ты никогда не забудешь про завершающий слэш.**
 
-4. **Проверь проброс IP.** Временно добавь в бэкенд-конфиг логирование заголовка,
-   или просто выполни на хосте:
-   ```bash
-   curl -s http://localhost/api/health -H "X-Debug: test"
-   ```
-   и посмотри в логах nginx (`docker compose logs nginx`), как проходит запрос.
-   Затем убери `proxy_set_header X-Real-IP …` и подумай, что потерял бы бэкенд.
+4. **Убедись, что бэкенд и фронт закрыты снаружи.** С хоста напрямую к ним не достучаться
+   (они `expose`, а не `ports`) — всё только через edge на :80. Проверь, что
+   `http://localhost/api/health` работает (через edge), а прямого доступа к `:8080` нет.
 
-5. **Со звёздочкой:** перепиши фронтенд-сервис как multi-stage сборку прямо в compose
-   (Node собирает `dist` → nginx его отдаёт), чтобы не собирать `npm run build` вручную.
-   Подсказка: у тебя уже был такой `frontend/Dockerfile` в истории проекта — вспомни
-   идею `FROM node ... AS builder` → `COPY --from=builder /app/dist`.
+5. **Разбери роли двух nginx.** Ответь словами: что делает nginx **внутри
+   фронт-контейнера**, а что — **edge-nginx**? Почему `vite preview` заменили именно
+   на nginx (вспомни: статика vs SSR, dev-инструмент vs прод)?
 
-6. **Ответь:** почему в compose мы поменяли у бэкенда `ports` на `expose`?
-   Что это меняет с точки зрения безопасности?
+6. **Ответь:** почему у бэкенда и фронта `expose`, а не `ports`? Что это меняет
+   с точки зрения безопасности?
 
 ---
 
@@ -1409,7 +1503,7 @@ server {
         proxy_pass http://backend:8080;
     }
     location / {
-        proxy_pass http://frontend:4173;
+        proxy_pass http://frontend:80;
     }
 }
 ```
@@ -1512,7 +1606,7 @@ server {
 
     # --- Фронтенд ---
     location / {
-        proxy_pass http://frontend:4173;
+        proxy_pass http://frontend:80;
 
         proxy_set_header Host              $host;
         proxy_set_header X-Real-IP         $remote_addr;
